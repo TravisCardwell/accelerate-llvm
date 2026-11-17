@@ -558,6 +558,8 @@ convert :: forall env. CoroutineBuilder -> ImportsBuilder -> InAwhile -> Env' en
 convert coroutine imports inAwhile env = \case
   Return -> returnNull
 
+  -- TODO Alet
+
   Release subset a -> do
     env' <- subEnv subset env
     convert coroutine imports inAwhile env' a
@@ -600,6 +602,10 @@ convert coroutine imports inAwhile env = \case
       setBlock blockExit
       envNext <- prepareYield coroutine False $ subsetEnv (splitSubsetRight split) env'
       convert coroutine imports inAwhile envNext next
+
+  -- TODO Awhile
+
+  -- TODO AwhileSeq
 
   Spawn split a b -> do
     -- Move variables used by 'a' to the coroutine struct. We still keep them
@@ -692,8 +698,6 @@ convert coroutine imports inAwhile env = \case
   -- whether it contains a yield or not. Variables before a possible yield will then also be moved to the struct.
   where
     convert' = convert coroutine imports inAwhile env
-  
-  -- TODO: Handle all constructors
 
 forkEnv :: Split True env env1 env2 -> Env' env -> CodeGen Native (Env' env1, Env' env2)
 forkEnv split env = do
