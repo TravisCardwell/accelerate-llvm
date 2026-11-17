@@ -57,6 +57,7 @@ import Data.Bits
 import Data.Text (unpack)
 import Data.IORef
 import Control.Monad
+import Control.Monad.IO.Class ( MonadIO(liftIO) )
 import Data.String
 import qualified Data.List as List
 import qualified Data.ByteString.Char8 as Char8
@@ -381,19 +382,24 @@ data CoroutineStruct where
 -- Generate a new block for the coroutine. The block index will be added to the
 -- switch statement in the entry block of the function.
 coroutineBlock :: CoroutineBuilder -> CodeGen Native (Int, Block)
-coroutineBlock coroutine = undefined
-  -- TODO: Get the current number of blocks from the IORef
-  -- and increment by one.
-  -- Create a new block using 'newBlockNamed $ blockName idx'
+coroutineBlock (CoroutineBuilder blockCount _) = do
+  idx <- liftCodeGen . liftIO $ atomicModifyIORef' blockCount (\n -> (n + 1, n))
+  let block = newBlockNamed $ blockName idx
+  return (idx, block)
 
 coroutineDeclare :: CoroutineBuilder -> InAwhile -> PrimType tp -> CodeGen Native Int
-coroutineDeclare coroutine inAwhile tp = undefined
-  -- TODO: Read cursor from CoroutineStruct,
-  -- compute size and alignment of tp via primSizeAlignment,
-  -- size' = if inAwhile then size * awhileConcurrentStates else size,
-  -- align cursor and increment by size' (using makeAligned from LLVM.AST.Type.Representation),
-  -- update type of state and cursor in CoroutineStruct.
-  -- Use liftIO to update the second IORef in CoroutineBuilder
+coroutineDeclare (CoroutineBuilder _ structRef) inAwhile tp =
+  liftCodeGen . liftIO . atomicModifyIORef' structRef $
+    if inAwhile
+      then go (ArrayPrimType awhileConcurrentStates tp)
+      else go tp
+  where
+    go :: PrimType tp' -> CoroutineStruct -> (CoroutineStruct, Int)
+    go tp' (CoroutineStruct stateType cursor) =
+      let (size, align) = primSizeAlignment tp'
+          offset = makeAligned cursor align
+          struct = CoroutineStruct (TupRpair stateType (TupRsingle tp')) (offset + size)
+      in  (struct, offset)
 
 coroutineDeclarePtr :: CoroutineBuilder -> InAwhile -> PrimType tp -> CodeGen Native (CodeGen Native (Operand (Ptr tp)))
 coroutineDeclarePtr coroutine inAwhile tp = do
@@ -424,13 +430,22 @@ coroutineDeclareValue coroutine inAwhile isInOut tp val keepRegister = do
 -- and whether it was *declared* in an awhile (not whether it is *used* in an
 -- awhile)
 coroutineField :: PrimType tp -> InAwhile -> Int -> CodeGen Native (Operand (Ptr tp))
-coroutineField = undefined
-  -- Cast operandProgram to i8*,
-  -- Compute o = offset + (if inAwhile then operandAwhileSlotIdx else 0)
-  -- Using GetElementPtr, add o to operandProgram
-  -- (eg in C: &(operandProgram as i8*)[o])
-  -- Cast to Ptr tp
-  -- Useful functions: ptrCast, A.add, GetElementPtr from LLVM.AST.Type.GetElementPtr (set last argument to GEPEmpty).
+coroutineField tp inAwhile offset = do
+  byteOffset <-
+    if inAwhile
+      then do
+        slotIdx8  <- instr' $ Load NonVolatile operandAwhileSlotIdx Nothing
+        slotIdx   <- instr' $ Ext (IntegralBoundedType TypeWord8) (IntegralBoundedType TypeInt) slotIdx8
+        slotBytes <- instr' $ Mul (IntegralNumType TypeInt) slotIdx (integral TypeInt stride)
+        instr'              $ Add (IntegralNumType TypeInt) slotBytes (integral TypeInt offset)
+      else
+        return (integral TypeInt offset)
+  ptr <- instr' $ GetElementPtr (GEP1 operandProgram byteOffset)
+  return (ptrCast tp ptr)
+  where
+    -- Size of one element, rounded up to alignment
+    stride :: Int
+    stride = uncurry makeAligned $ primSizeAlignment tp
 
 baseBufferEltR :: BaseR tp -> Either (ReprBaseR tp :~: BufferEltR (ReprBaseR tp)) (ScalarType (ReprBaseR tp))
 baseBufferEltR = \case
@@ -504,25 +519,34 @@ prjValue i env = case prj' i env of
           instrMD' (Load NonVolatile ptr Nothing) (bufferMetadata' Nothing)
 
 prepareYield :: CoroutineBuilder -> Bool -> Env' env -> CodeGen Native (Env' env)
-prepareYield coroutine keepRegister = mapMEnv f
-  where
-    f :: Value t -> CodeGen Native (Value t)
-    f (Value isInOut tp inAwhile _ offset@(Just _)) = return $
-      -- If value is already stored in the coroutine struct, we don't need to
-      -- allocate any new space. We do need to remove the register/operand for
-      -- this value, as that operand is no longer available after resuming the
-      -- coroutine
-      Value isInOut tp inAwhile Nothing offset
-    f (Value isInOut tp inAwhile (Just operand) Nothing) =
-      -- If the value is not yet stored in the coroutine struct, allocate space
-      -- in the struct and write the value to that location.
-      coroutineDeclareValue coroutine inAwhile isInOut tp (Just operand) keepRegister
-    f (Value _ _ _ Nothing Nothing) = internalError "Value should have a register or struct storage (or both)"
+prepareYield coroutine keepRegister = mapMEnv (moveToStruct coroutine keepRegister)
+
+moveToStruct :: CoroutineBuilder -> Bool -> Value t -> CodeGen Native (Value t)
+moveToStruct coroutine keepRegister v = case v of
+  -- If value is already stored in the coroutine struct, we don't need to
+  -- allocate any new space. We do need to remove the register/operand for this
+  -- value, as that operand is no longer available after resuming the coroutine.
+  Value isInOut tp inAwhile _mOperand offset@(Just _)
+    | keepRegister -> return v
+    | otherwise    -> return $ Value isInOut tp inAwhile Nothing offset
+
+  -- If the value is not yet stored in the coroutine struct, allocate space in
+  -- the struct and write the value to that location.
+  Value isInOut tp inAwhile (Just operand) Nothing ->
+    coroutineDeclareValue coroutine inAwhile isInOut tp (Just operand) keepRegister
+
+  Value _isInOut _tp _inAwhile Nothing Nothing ->
+    internalError "Value should have a register or struct storage (or both)"
 
 -- | Variant of prepareYield that operates on a subset of the bindings in the
 -- environment. Values are kept in registers.
 prepareYieldSubset :: CoroutineBuilder -> IdxSet env -> Env' env -> CodeGen Native (Env' env)
-prepareYieldSubset = undefined -- TODO: Implement
+prepareYieldSubset coroutine = go . IdxSet.unIdxSet
+  where
+    go :: PartialEnv IdxSet.Present env -> Env' env -> CodeGen Native (Env' env)
+    go PEnd        env          = return env
+    go (PPush s _) (Push env v) = Push <$> go s env <*> moveToStruct coroutine True v
+    go (PNone s)   (Push env v) = Push <$> go s env <*> pure v
 
 convert :: forall env. CoroutineBuilder -> ImportsBuilder -> InAwhile -> Env' env -> UniformScheduleRC NativeKernel env -> CodeGen Native ()
 convert coroutine imports inAwhile env = \case
@@ -565,8 +589,10 @@ convert coroutine imports inAwhile env = \case
       convert coroutine imports inAwhile envF whenFalse'
       _ <- br blockExit
 
+      -- Variables used in 'next' are in the coroutine struct even if 'whenTrue'
+      -- or 'whenFalse' yields, not in registers.
       setBlock blockExit
-      let envNext = subsetEnv (splitSubsetRight split) env'
+      envNext <- prepareYield coroutine False $ subsetEnv (splitSubsetRight split) env'
       convert coroutine imports inAwhile envNext next
 
   Spawn split a b -> do
