@@ -1,4 +1,3 @@
-{-# LANGUAGE DataKinds            #-}
 {-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
