@@ -502,12 +502,18 @@ valueInRegister _ = False
 type Env' = Env Value
 
 prjPtr :: Idx env t -> Env' env -> CodeGen Native (Operand (Ptr (StorageBaseR t)))
-prjPtr i env = case prj' i env of
+prjPtr i = valuePtr . prj' i
+
+valuePtr :: Value t -> CodeGen Native (Operand (Ptr (StorageBaseR t)))
+valuePtr = \case
   Value _ tp inAwhile _ (Just offset) -> coroutineField (toStoragePrimType tp) inAwhile offset
   Value _ _ _ _ Nothing -> internalError "Expected value in struct"
 
 prjValue :: Idx env t -> Env' env -> CodeGen Native (Operand (ReprBaseR t))
-prjValue i env = case prj' i env of
+prjValue i = valueOperand . prj' i
+
+valueOperand :: Value t -> CodeGen Native (Operand (ReprBaseR t))
+valueOperand = \case
   Value _ _ _ (Just operand) _ -> return operand
   Value _ tp inAwhile _ (Just offset) -> do
     ptr <- coroutineField (toStoragePrimType tp) inAwhile offset
@@ -702,19 +708,38 @@ subEnv subset env = do
   release env $ IdxSet.subsetDropped subset
   return $ subsetEnv subset env
 
--- TODO: Increment reference counts for bindings in set.
--- Recurse over set and env (as a zip), and emit the correct instruction to increment the reference count
--- of a buffer or buffer reference.
--- See the old forkEnv
+-- | Increment reference counts for bindings in the set
 retain :: Env' env -> IdxSet env -> CodeGen Native ()
-retain = undefined
+retain =
+  refCount (Label "accelerate_buffer_retain") (Label "accelerate_ref_retain")
 
--- TODO: Decrement reference counts for bindings in set.
--- Recurse over set and env (as a zip), and emit the correct instruction to decrement the reference count
--- of a buffer or buffer reference.
--- See the old subEnv
+-- | Decrement reference counts for bindings in the set
 release :: Env' env -> IdxSet env -> CodeGen Native ()
-release = undefined
+release =
+  refCount (Label "accelerate_buffer_release") (Label "accelerate_ref_release")
+
+refCount :: Label -> Label -> Env' env -> IdxSet env -> CodeGen Native ()
+refCount bufferFn refFn env = (`go` env) . IdxSet.unIdxSet
+  where
+    go :: PartialEnv IdxSet.Present env' -> Env' env' -> CodeGen Native ()
+    go PEnd        _             = return ()
+    go (PPush s _) (Push env' v) = go s env' >> binding v
+    go (PNone s)   (Push env' _) = go s env'
+
+    binding :: Value t -> CodeGen Native ()
+    binding v@(Value _ tp _ _ _) = case tp of
+      BaseRground GroundRbuffer{} -> callFn bufferFn =<< valueOperand v
+      BaseRref    GroundRbuffer{} -> callFn refFn    =<< valuePtr     v
+      _otherwise                  -> return ()
+
+    callFn :: Label -> Operand (Ptr t) -> CodeGen Native ()
+    callFn fn ptr = do
+      ptr' <- instr' $ PtrCast (primType @(Ptr Int8)) ptr
+      _ <- callLocal
+        (LLVM.lamUnnamed primType (LLVM.Body VoidType Nothing fn))
+        (LLVM.ArgumentsCons ptr' [] LLVM.ArgumentsNil)
+        []
+      return ()
 
 -- Compared to the old implementation, we replaced StructVars & LocalVars with Env'
 -- and we remove phase 1. Functionality of phase 1 is replaced as follows:
