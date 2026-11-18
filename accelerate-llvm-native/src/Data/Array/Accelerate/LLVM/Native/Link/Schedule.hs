@@ -383,13 +383,13 @@ data CoroutineStruct where
 -- switch statement in the entry block of the function.
 coroutineBlock :: CoroutineBuilder -> CodeGen Native (Int, Block)
 coroutineBlock (CoroutineBuilder blockCount _) = do
-  idx <- liftCodeGen . liftIO $ atomicModifyIORef' blockCount (\n -> (n + 1, n))
+  idx <- liftIO . atomicModifyIORef' blockCount $ \n -> (n + 1, n)
   let block = newBlockNamed $ blockName idx
   return (idx, block)
 
 coroutineDeclare :: CoroutineBuilder -> InAwhile -> PrimType tp -> CodeGen Native Int
 coroutineDeclare (CoroutineBuilder _ structRef) inAwhile tp =
-  liftCodeGen . liftIO . atomicModifyIORef' structRef $
+  liftIO . atomicModifyIORef' structRef $
     if inAwhile
       then go (ArrayPrimType awhileConcurrentStates tp)
       else go tp
